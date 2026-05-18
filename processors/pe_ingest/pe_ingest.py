@@ -299,18 +299,23 @@ def _extract_one(archive: Path, dest: Path, timeout: int) -> tuple[Path, int]:
 
 
 def _extract_archive(archive: Path, dest: Path, timeout: int = 1800) -> None:
-    """Extract .7z or .zip archive to dest directory."""
+    """Extract .7z or .zip archive to dest directory — only .sys files, preserving
+    directory structure. Non-driver files (.inf, .cat, .dll, .exe, etc.) are skipped
+    to save disk space."""
     suffix = archive.suffix.lower()
     if suffix == ".zip":
         with zipfile.ZipFile(archive, "r") as zf:
-            zf.extractall(dest)
+            for member in zf.namelist():
+                if member.lower().endswith(".sys"):
+                    zf.extract(member, dest)
     elif suffix == ".7z":
-        # prefer 7z CLI (handles solid archives, large files)
+        # Extract only *.sys, preserving directory structure (-r for recursive)
         result = subprocess.run(
-            ["7z", "x", "-y", f"-o{dest}", str(archive)],
+            ["7z", "x", "-y", f"-o{dest}", str(archive), "*.sys", "-r"],
             capture_output=True, text=True, timeout=timeout,
         )
-        if result.returncode != 0:
+        # 7z returns 0 on success, 1 for warnings (e.g. no matching files), 2+ for errors
+        if result.returncode >= 2:
             raise RuntimeError(f"7z failed: {result.stderr.strip()}")
     else:
         raise ValueError(f"unsupported archive format: {suffix}")
