@@ -767,12 +767,17 @@ class PipelineRunner:
         if timeout <= 0:
             return processor.process(ctx, entry)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
             future = executor.submit(processor.process, ctx, entry)
-            try:
-                return future.result(timeout=timeout)
-            except concurrent.futures.TimeoutError:
-                raise TimeoutError(f"processor timed out after {timeout}s")
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            # Must shutdown with wait=False — the default wait=True blocks
+            # until the running thread finishes, making the timeout useless.
+            executor.shutdown(wait=False)
+            raise TimeoutError(f"processor timed out after {timeout}s")
+        finally:
+            executor.shutdown(wait=False)
 
     def _generate_context_files(self, sample_states: dict[str, SampleState]) -> None:
         active_items = [(sid, state) for sid, state in sample_states.items() if state.is_active()]
