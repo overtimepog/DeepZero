@@ -90,27 +90,37 @@ class PEIngest(IngestProcessor):
             return
 
         max_workers = min(len(pending), ctx.get_setting("max_workers", 4))
-        self.log.info("extracting %d archives in parallel (%d workers)...",
-                      len(pending), max_workers)
+        self.log.info(
+            "extracting %d archives in parallel (%d workers): %s",
+            len(pending), max_workers,
+            ", ".join(a.name for a in pending[:10]) + ("..." if len(pending) > 10 else ""),
+        )
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
+        completed = 0
+        total = len(pending)
         futures: dict = {}
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             for arc in pending:
                 dest = cache / arc.stem
-                self.log.debug("starting: %s", arc.name)
                 futures[executor.submit(_extract_one, arc, dest)] = arc
 
             for future in as_completed(futures):
                 arc = futures[future]
                 try:
                     dest, file_count = future.result()
+                    completed += 1
                     self.log.info(
-                        "extracted %d files from %s", file_count, arc.name
+                        "[%d/%d] extracted %d files from %s",
+                        completed, total, file_count, arc.name,
                     )
                 except Exception as e:
-                    self.log.error("failed to extract %s: %s", arc.name, e)
+                    completed += 1
+                    self.log.error(
+                        "[%d/%d] failed to extract %s: %s",
+                        completed, total, arc.name, e,
+                    )
 
         self.log.info("archive extraction complete — %d archives processed", len(pending))
 
