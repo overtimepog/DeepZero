@@ -77,22 +77,39 @@ class PEIngest(IngestProcessor):
         self.log.info("found %d archives to extract", len(archives))
         cache = self._resolve_archive_cache(target, archive_cache_dir)
 
+        # Filter to archives that actually need extraction (check sentinel)
+        pending: list[Path] = []
         for arc in archives:
             dest = cache / arc.stem
-            sentinel = dest / ".extracted"
-            if sentinel.exists():
+            if not (dest / ".extracted").exists():
+                dest.mkdir(parents=True, exist_ok=True)
+                pending.append(arc)
+            else:
                 self.log.debug("archive already extracted: %s -> %s", arc.name, dest)
-                continue
 
-            self.log.info("extracting: %s ...", arc.name)
-            dest.mkdir(parents=True, exist_ok=True)
-            try:
-                _extract_archive(arc, dest)
-                sentinel.touch()
-                self.log.info("extracted %d files from %s",
-                              sum(1 for _ in dest.rglob("*") if _.is_file()), arc.name)
-            except Exception as e:
-                self.log.error("failed to extract %s: %s", arc.name, e)
+        if not pending:
+            return
+
+        self.log.info("extracting %d archives in parallel...", len(pending))
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        max_workers = min(len(pending), ctx.get_setting("max_workers", 4))
+        futures: dict = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for arc in pending:
+                dest = cache / arc.stem
+                futures[executor.submit(_extract_one, arc, dest)] = arc
+
+            for future in as_completed(futures):
+                arc = futures[future]
+                try:
+                    dest, file_count = future.result()
+                    self.log.info(
+                        "extracted %d files from %s", file_count, arc.name
+                    )
+                except Exception as e:
+                    self.log.error("failed to extract %s: %s", arc.name, e)
 
     def _ingest_archive(
         self, ctx: ProcessorContext, target: Path,
@@ -216,6 +233,15 @@ class PEIngest(IngestProcessor):
         if data is not None and data[:2] == b"MZ":
             meta.update(_parse_pe(data, self.config.get("subsystem_filter", [])))
         return meta
+
+
+def _extract_one(archive: Path, dest: Path) -> tuple[Path, int]:
+    """Extract an archive and return (dest, file_count). Thread-safe — each
+    archive extracts to a unique destination."""
+    _extract_archive(archive, dest)
+    (dest / ".extracted").touch()
+    file_count = sum(1 for _ in dest.rglob("*") if _.is_file())
+    return dest, file_count
 
 
 def _extract_archive(archive: Path, dest: Path) -> None:
