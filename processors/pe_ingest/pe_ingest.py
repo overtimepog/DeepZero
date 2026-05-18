@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import shutil
 import subprocess
 import zipfile
 from pathlib import Path
@@ -90,15 +89,17 @@ class PEIngest(IngestProcessor):
         if not pending:
             return
 
-        self.log.info("extracting %d archives in parallel...", len(pending))
+        max_workers = min(len(pending), ctx.get_setting("max_workers", 4))
+        self.log.info("extracting %d archives in parallel (%d workers)...",
+                      len(pending), max_workers)
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        max_workers = min(len(pending), ctx.get_setting("max_workers", 4))
         futures: dict = {}
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             for arc in pending:
                 dest = cache / arc.stem
+                self.log.debug("starting: %s", arc.name)
                 futures[executor.submit(_extract_one, arc, dest)] = arc
 
             for future in as_completed(futures):
@@ -110,6 +111,8 @@ class PEIngest(IngestProcessor):
                     )
                 except Exception as e:
                     self.log.error("failed to extract %s: %s", arc.name, e)
+
+        self.log.info("archive extraction complete — %d archives processed", len(pending))
 
     def _ingest_archive(
         self, ctx: ProcessorContext, target: Path,
