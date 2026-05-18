@@ -1,11 +1,11 @@
 # SDI R2601 triage pipeline: PE ingest → filter → top-30 → Ghidra + semgrep → LLM
 # Runs Ghidra only on top 30 priority candidates — fast enough for 6,868 driver corpus
-# Ghidra 12.1+ with pyghidra, JVM tuned (4G heap, G1GC, no --skip-analysis)
+# Ghidra 12.1+ with pyghidra, JVM tuned (1G heap, ParallelGC, skip_analysis)
 # Auto-extracts .7z/.zip archives during discovery
 
 name: loldrivers_sdi
 description: SDI R2601 driver corpus triage with Ghidra on top hits
-version: "3.1"
+version: "3.2"
 
 model: deepseek/deepseek-v4-flash
 
@@ -60,22 +60,24 @@ stages:
       sort_order: desc
 
   # Ghidra decompile — only on top 30 candidates
-  # parallel=0 auto-scales to hardware; JVM 4G heap + G1GC; no --skip-analysis
+  # skip_analysis skips full auto-analysis (type propagation, data-flow) — the dispatch
+  # extraction script only needs function identification + decompiler (3-5x faster).
+  # ParallelGC beats G1GC for short-lived JVMs. 1g heap is plenty for kernel drivers.
   # auto-cleans .gpr/.rep project dirs after each decompile
   - name: decompile
     processor: ghidra_decompile/ghidra_decompile.py
     parallel: 0
-    timeout: 1800
+    timeout: 600
     config:
       strategy: extract_dispatch.py
       max_functions: 60
       max_depth: 4
       ghidra_install_dir: ${GHIDRA_INSTALL_DIR}
       java_home: ${JAVA_HOME:-}
-      skip_analysis: false
-      jvm_max_heap: "4g"
-      jvm_init_heap: "2g"
-      jvm_gc: "G1GC"
+      skip_analysis: true
+      jvm_max_heap: "1g"
+      jvm_init_heap: "512m"
+      jvm_gc: "ParallelGC"
       project_base: "/tmp/ghidra_projects"
 
   # semgrep batch scan for IOCTL vulnerability patterns

@@ -5,12 +5,12 @@
 #
 # Pipeline flow:
 #   discover (auto-extract .7z/.zip) → kernel_filter → loldrivers_filter → fast_extract+filter
-#     → pick_top_200 (gate by priority_score) → decompile (Ghidra)
+#     → pick_top_200 (gate by priority_score) → decompile (Ghidra, skip_analysis)
 #     → semgrep_barrier → assess (LLM) → cleanup
 
 name: loldrivers_fast
 description: Fast triage with Ghidra gated behind priority scoring + semgrep barrier + early filtering
-version: "5.1"
+version: "5.2"
 
 model: deepseek/deepseek-v4-flash
 
@@ -70,21 +70,24 @@ stages:
       sort_order: desc
 
   # Ghidra decompile — only on the top 200 candidates
+  # skip_analysis skips full auto-analysis (type propagation, data-flow) — the dispatch
+  # extraction script only needs function identification + decompiler (3-5x faster).
+  # ParallelGC beats G1GC for short-lived JVMs. 1g heap is plenty for kernel drivers.
   # auto-cleans .gpr/.rep project dirs after each decompile
   - name: decompile
     processor: ghidra_decompile/ghidra_decompile.py
-    parallel: 20
-    timeout: 1800
+    parallel: 0
+    timeout: 600
     config:
       strategy: extract_dispatch.py
       max_functions: 60
       max_depth: 4
       ghidra_install_dir: ${GHIDRA_INSTALL_DIR}
       java_home: ${JAVA_HOME:-}
-      skip_analysis: false
-      jvm_max_heap: "4g"
-      jvm_init_heap: "2g"
-      jvm_gc: "G1GC"
+      skip_analysis: true
+      jvm_max_heap: "1g"
+      jvm_init_heap: "512m"
+      jvm_gc: "ParallelGC"
       project_base: "/tmp/ghidra_projects"
 
   # semgrep batch scan on decompiled C — barrier: drops drivers with 0 findings

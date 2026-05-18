@@ -11,7 +11,7 @@
 
 name: loldrivers
 description: windows kernel driver vulnerability research pipeline (DeepSeek)
-version: "2.1"
+version: "2.2"
 
 model: deepseek/deepseek-v4-flash
 
@@ -43,17 +43,24 @@ stages:
     processor: loldrivers_filter/loldrivers_filter.py
 
   # decompile with ghidra
+  # skip_analysis skips full auto-analysis (type propagation, data-flow) — the dispatch
+  # extraction script only needs function identification + decompiler (3-5x faster).
+  # ParallelGC beats G1GC for short-lived JVMs. 1g heap is plenty for kernel drivers.
   # auto-cleans .gpr/.rep project dirs after each decompile
   - name: decompile
     processor: ghidra_decompile/ghidra_decompile.py
     parallel: 0
-    timeout: 1800
+    timeout: 600
     config:
       strategy: extract_dispatch.py
       max_functions: 100
       max_depth: 4
       ghidra_install_dir: ${GHIDRA_INSTALL_DIR}
       java_home: ${JAVA_HOME:-}
+      skip_analysis: true
+      jvm_max_heap: "1g"
+      jvm_init_heap: "512m"
+      jvm_gc: "ParallelGC"
 
   # semgrep batch scan for driver vulns
   - name: semgrep_scanner
