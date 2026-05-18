@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ioctl-static-analyzer"
+version = "0.1.0"
+description = "Static Windows kernel driver IOCTL dispatch discovery and CFG exporter"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Perplexity Computer" }]
+license = { text = "MIT" }
+dependencies = [
+  "capstone>=5.0.0",
+  "pefile>=2023.2.7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+ioctl-analyzer = "ioctl_analyzer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ioctl_analyzer*"]
+

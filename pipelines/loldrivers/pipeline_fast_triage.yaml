@@ -41,14 +41,11 @@ stages:
   - name: loldrivers_filter
     processor: loldrivers_filter/loldrivers_filter.py
 
-  # Fast IOCTL code + device path extraction via Capstone/objdump (~2s/driver)
-  # runs on ALL survivors — cheap enrichment + EARLY FILTERING before Ghidra
-  # FILTERS: drops drivers with no IOCTL codes and no device path (dead/irrelevant)
-  # v3.1: IOCTL detection no longer restricted to known device type ranges —
-  # any plausible IOCTL code passes sanity checks. known_range: true/false
-  # added to each IOCTL entry for visibility.
+  # Static IOCTL dispatch analysis with data-flow tracking (Capstone)
+  # v4.0: replaces objdump_extract — data-flow tracking, jump table recovery,
+  # confidence scoring, no device type range restrictions
   - name: fast_extract
-    processor: objdump_extract/objdump_extract.py
+    processor: ioctl_static_analyzer/ioctl_static_analyzer.py
     parallel: 0
     config:
       max_ioctl_codes: 50

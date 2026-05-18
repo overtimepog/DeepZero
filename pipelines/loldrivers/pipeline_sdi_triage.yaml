@@ -36,10 +36,10 @@ stages:
   - name: loldrivers_filter
     processor: loldrivers_filter/loldrivers_filter.py
 
-  # Fast objdump extraction — enriches metadata with IOCTL codes + device paths
-  # v2.0: filters dead drivers before the Ghidra gate
+  # Static IOCTL dispatch analysis with data-flow tracking (Capstone)
+  # v4.0: replaces objdump_extract — data-flow tracking, jump table recovery, confidence scoring
   - name: fast_extract
-    processor: objdump_extract/objdump_extract.py
+    processor: ioctl_static_analyzer/ioctl_static_analyzer.py
     parallel: 0
     config:
       max_ioctl_codes: 50

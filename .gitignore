@@ -52,3 +52,4 @@ docs/_site/
 docs/.jekyll-cache/
 _site/
 hs_err_pid36440.log
+*.zip
