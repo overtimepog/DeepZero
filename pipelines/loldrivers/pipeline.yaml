@@ -44,7 +44,7 @@ stages:
         - DP_xUSB
         - DP_Vendor
 
-  # filter to kernel drivers with IOCTL attack surface + dedup
+  # filter to kernel drivers with IOCTL surface, dedup exact sha256 duplicates
   - name: kernel_filter
     processor: metadata_filter
     config:

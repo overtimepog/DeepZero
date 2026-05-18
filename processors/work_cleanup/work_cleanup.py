@@ -57,6 +57,11 @@ class WorkCleanup(BulkMapProcessor):
             removed_mb = self._clean_stale_ghidra_projects(ghidra_project_base)
             stats["ghidra_projects_mb_freed"] = int(removed_mb)
 
+        # 5. Clean miscellaneous temp files (pycache, JVM logs, leftover dirs)
+        removed_mb = self._clean_temp_files()
+        if removed_mb > 0:
+            stats["temp_files_mb_freed"] = int(removed_mb)
+
         self.log.info("cleanup complete: %s", stats)
 
         # Return one OK result so the pipeline doesn't think every sample failed
@@ -205,6 +210,46 @@ class WorkCleanup(BulkMapProcessor):
         if freed > 0:
             self.log.info("removed stale Ghidra projects — %.1f MB freed", freed)
         return freed
+
+
+    # ── temp file cleanup ────────────────────────────────────────
+
+    def _clean_temp_files(self) -> float:
+        """Remove __pycache__, JVM crash logs, leftover bulk/temp dirs, and Ghidra tmp dirs."""
+        freed = 0.0
+        processors_dir = Path(__file__).resolve().parent.parent
+
+        # __pycache__ dirs under processors/
+        for pycache in processors_dir.rglob("__pycache__"):
+            if pycache.is_dir():
+                size = _dir_size(pycache)
+                shutil.rmtree(pycache, ignore_errors=True)
+                freed += size
+
+        # JVM crash logs (hs_err_pid*.log)
+        for pattern in ["hs_err_pid*.log", "replay_pid*.log", "javacore*.txt"]:
+            for f in Path.cwd().glob(pattern):
+                if f.is_file():
+                    freed += f.stat().st_size
+                    f.unlink(missing_ok=True)
+
+        # Leftover Ghidra temp dirs (/tmp/ghidra_*)
+        for tmp_dir in Path("/tmp").glob("ghidra_*"):
+            if tmp_dir.is_dir():
+                size = _dir_size(tmp_dir)
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                freed += size
+
+        # Leftover bulk temp dirs from semgrep
+        for bulk_dir in Path("/tmp").glob(".bulk_temp*"):
+            if bulk_dir.is_dir():
+                size = _dir_size(bulk_dir)
+                shutil.rmtree(bulk_dir, ignore_errors=True)
+                freed += size
+
+        if freed > 0:
+            self.log.info("cleaned temp files — %.1f MB freed", freed / (1024 * 1024))
+        return freed / (1024 * 1024)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────

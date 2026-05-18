@@ -24,7 +24,7 @@ stages:
       archive_extensions: [".7z", ".zip"]
       archive_extract_timeout: 1800
 
-  # filter to kernel drivers with IOCTL attack surface + dedup
+  # filter to kernel drivers with IOCTL surface, dedup exact sha256 duplicates
   - name: kernel_filter
     processor: metadata_filter
     config:
