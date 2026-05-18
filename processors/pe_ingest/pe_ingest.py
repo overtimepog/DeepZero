@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+import time
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -21,11 +22,21 @@ class PEIngest(IngestProcessor):
         subdirs = self.config.get("subdirs", [])
         archive_extensions = self.config.get("archive_extensions", [])
         archive_cache_dir = self.config.get("archive_cache_dir", "")
+        archive_timeout = self.config.get("archive_extract_timeout", 1800)
+        archive_cooldown = self._resolve_archive_cooldown()
 
         if target.is_file():
             # Try archive extraction for single archive files
             if target.suffix.lower() in (".7z", ".zip") and archive_extensions:
-                return self._ingest_archive(ctx, target, extensions, recursive, archive_cache_dir)
+                return self._ingest_archive(
+                    ctx,
+                    target,
+                    extensions,
+                    recursive,
+                    archive_cache_dir,
+                    archive_cooldown,
+                    archive_timeout,
+                )
             return self._ingest_single(target)
 
         if not target.is_dir():
@@ -35,7 +46,14 @@ class PEIngest(IngestProcessor):
         # Extract archives first if configured, so downstream .sys discovery
         # picks up the extracted files alongside any pre-existing .sys files.
         if archive_extensions:
-            self._extract_archives(ctx, target, archive_extensions, archive_cache_dir)
+            self._extract_archives(
+                ctx,
+                target,
+                archive_extensions,
+                archive_cache_dir,
+                archive_cooldown,
+                archive_timeout,
+            )
 
         if subdirs:
             return self._ingest_filtered(ctx, target, subdirs, extensions)
@@ -50,6 +68,23 @@ class PEIngest(IngestProcessor):
 
     # ── archive extraction ────────────────────────────────────────────────
 
+    def _resolve_archive_cooldown(self) -> float:
+        """Resolve optional archive extraction cooldown in seconds.
+
+        Accepted keys (in priority order): archive_cooldown_seconds,
+        archive_cooldown, cooldown.
+        """
+        raw = self.config.get(
+            "archive_cooldown_seconds",
+            self.config.get("archive_cooldown", self.config.get("cooldown", 0)),
+        )
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            self.log.warning("invalid archive cooldown value %r, defaulting to 0", raw)
+            return 0.0
+        return max(0.0, value)
+
     def _resolve_archive_cache(self, target: Path, archive_cache_dir: str) -> Path:
         """Resolve the archive extraction cache directory."""
         if archive_cache_dir:
@@ -62,6 +97,7 @@ class PEIngest(IngestProcessor):
     def _extract_archives(
         self, ctx: ProcessorContext, target: Path,
         archive_extensions: list[str], archive_cache_dir: str,
+        archive_cooldown: float, archive_timeout: int,
     ) -> None:
         """Find and extract .7z/.zip archives before .sys discovery."""
         archives: list[Path] = []
@@ -101,9 +137,12 @@ class PEIngest(IngestProcessor):
         total = len(pending)
         futures: dict = {}
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for arc in pending:
+            for idx, arc in enumerate(pending):
                 dest = cache / arc.stem
-                futures[executor.submit(_extract_one, arc, dest)] = arc
+                futures[executor.submit(_extract_one, arc, dest, archive_timeout)] = arc
+                # Stagger extraction start to reduce I/O and process contention.
+                if archive_cooldown > 0 and idx < (total - 1):
+                    time.sleep(archive_cooldown)
 
             for future in as_completed(futures):
                 arc = futures[future]
@@ -126,6 +165,7 @@ class PEIngest(IngestProcessor):
     def _ingest_archive(
         self, ctx: ProcessorContext, target: Path,
         extensions: list[str], recursive: bool, archive_cache_dir: str,
+        archive_cooldown: float, archive_timeout: int,
     ) -> list[Sample]:
         """Single-file mode: target is an archive. Extract and discover .sys inside."""
         cache = self._resolve_archive_cache(target.parent, archive_cache_dir)
@@ -135,7 +175,9 @@ class PEIngest(IngestProcessor):
         if not sentinel.exists():
             self.log.info("extracting: %s ...", target.name)
             dest.mkdir(parents=True, exist_ok=True)
-            _extract_archive(target, dest)
+            if archive_cooldown > 0:
+                time.sleep(archive_cooldown)
+            _extract_archive(target, dest, archive_timeout)
             sentinel.touch()
         else:
             self.log.info("archive already extracted: %s", target.name)
@@ -247,16 +289,16 @@ class PEIngest(IngestProcessor):
         return meta
 
 
-def _extract_one(archive: Path, dest: Path) -> tuple[Path, int]:
+def _extract_one(archive: Path, dest: Path, timeout: int) -> tuple[Path, int]:
     """Extract an archive and return (dest, file_count). Thread-safe — each
     archive extracts to a unique destination."""
-    _extract_archive(archive, dest)
+    _extract_archive(archive, dest, timeout)
     (dest / ".extracted").touch()
     file_count = sum(1 for _ in dest.rglob("*") if _.is_file())
     return dest, file_count
 
 
-def _extract_archive(archive: Path, dest: Path) -> None:
+def _extract_archive(archive: Path, dest: Path, timeout: int = 1800) -> None:
     """Extract .7z or .zip archive to dest directory."""
     suffix = archive.suffix.lower()
     if suffix == ".zip":
@@ -266,7 +308,7 @@ def _extract_archive(archive: Path, dest: Path) -> None:
         # prefer 7z CLI (handles solid archives, large files)
         result = subprocess.run(
             ["7z", "x", "-y", f"-o{dest}", str(archive)],
-            capture_output=True, text=True, timeout=600,
+            capture_output=True, text=True, timeout=timeout,
         )
         if result.returncode != 0:
             raise RuntimeError(f"7z failed: {result.stderr.strip()}")

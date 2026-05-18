@@ -22,6 +22,7 @@ stages:
       extensions: [".sys"]
       recursive: true
       archive_extensions: [".7z", ".zip"]
+      archive_extract_timeout: 1800
 
   # filter to kernel drivers with IOCTL attack surface + dedup
   - name: kernel_filter

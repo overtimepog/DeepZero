@@ -23,10 +23,12 @@ stages:
   # auto-extracts .7z/.zip archives into .deepzero_cache/extracted/
   - name: discover
     processor: pe_ingest/pe_ingest.py
+    timeout: 1800
     config:
       extensions: [".sys"]
       recursive: true
       archive_extensions: [".7z", ".zip"]
+      archive_extract_timeout: 1800
 
   # filter to kernel drivers with IOCTL attack surface + dedup
   - name: kernel_filter
@@ -65,7 +67,7 @@ stages:
   - name: decompile
     processor: ghidra_decompile/ghidra_decompile.py
     parallel: 0
-    timeout: 600
+    timeout: 1800
     config:
       strategy: extract_dispatch.py
       max_functions: 60

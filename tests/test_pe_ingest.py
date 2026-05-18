@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import zipfile
 
 from deepzero.engine.stage import ProcessorContext, StageSpec
+import processors.pe_ingest.pe_ingest as pe_ingest_module
 from processors.pe_ingest.pe_ingest import PEIngest
 
 
@@ -120,3 +122,46 @@ class TestPEIngestMetadata:
         assert data["sha256"] == hashlib.sha256(content).hexdigest()
         assert data["md5"] == hashlib.md5(content, usedforsecurity=False).hexdigest()
         assert data["size_bytes"] == len(content)
+
+
+class TestPEIngestCooldown:
+    def _make_tool(self):
+        spec = StageSpec(name="discover", processor="pe_ingest")
+        return PEIngest(spec)
+
+    def test_resolve_archive_cooldown_aliases(self):
+        processor = self._make_tool()
+
+        processor.config["cooldown"] = 0.5
+        assert processor._resolve_archive_cooldown() == 0.5
+
+        processor.config["archive_cooldown"] = 0.25
+        assert processor._resolve_archive_cooldown() == 0.25
+
+        processor.config["archive_cooldown_seconds"] = "0.1"
+        assert processor._resolve_archive_cooldown() == 0.1
+
+    def test_extract_archives_applies_cooldown(self, tmp_path, monkeypatch):
+        processor = self._make_tool()
+        processor.config["archive_extensions"] = [".zip"]
+        processor.config["cooldown"] = 0.05
+
+        for name in ("a.zip", "b.zip"):
+            arc = tmp_path / name
+            with zipfile.ZipFile(arc, "w") as zf:
+                zf.writestr("x.sys", b"dummy")
+
+        sleep_calls: list[float] = []
+        monkeypatch.setattr(pe_ingest_module.time, "sleep", sleep_calls.append)
+        monkeypatch.setattr(pe_ingest_module, "_extract_archive", lambda archive, dest: None)
+
+        ctx = ProcessorContext(
+            pipeline_dir=tmp_path,
+            global_config={"settings": {"max_workers": 1}},
+            llm=None,
+        )
+
+        processor.process(ctx, tmp_path)
+
+        # Two archives are extracted with one stagger delay between submissions.
+        assert sleep_calls == [0.05]
