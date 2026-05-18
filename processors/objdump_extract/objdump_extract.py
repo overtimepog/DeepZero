@@ -757,26 +757,31 @@ class ObjdumpExtract(MapProcessor):
             return None
 
     def _is_valid_ioctl(self, value: int, ranges: list[str]) -> bool:
-        """Check if a value looks like a valid IOCTL code."""
-        # Sanity bounds
+        """Check if a value looks like a valid IOCTL code.
+
+        Sanity checks only — does NOT require matching known device type ranges.
+        Known ranges are used for prioritization/classification, not rejection.
+        This prevents filtering drivers with obscure/custom device types.
+        """
+        # Sanity bounds — must be a 32-bit value with plausible upper bits
         if value < 0x1000 or value > 0xFFFFFFFF:
             return False
 
         # Filter obvious garbage: 0x00000000, 0xFFFFFFFF, 0xCCCCCCCC, 0x90909090
         low_word = value & 0xFFFF
         if low_word in (0x0000, 0xFFFF, 0xCCCC, 0x9090, 0x0F0F):
-            # Allow 0x0000 if the upper part is valid (rare but possible)
-            if low_word == 0x0000 and not self._match_any_range(value, ranges):
+            # Allow 0x0000 low word only if upper 16 bits are non-zero (valid device type)
+            if low_word == 0x0000 and (value >> 16) == 0:
                 return False
-            if low_word != 0x0000:
+            if low_word not in (0x0000,):
                 return False
 
         # All-zeros, all-ones, common padding patterns
         if value in (0x00000000, 0xFFFFFFFF, 0xCCCCCCCC, 0x90909090, 0x0F0F0F0F):
             return False
 
-        # Check ranges
-        return self._match_any_range(value, ranges)
+        # Passed all sanity checks — accept even if device type is not in known ranges
+        return True
 
     def _match_any_range(self, value: int, ranges: list[str]) -> bool:
         for r in ranges:
@@ -806,14 +811,16 @@ class ObjdumpExtract(MapProcessor):
 
     def _make_ioctl_entry(self, offset: str, code_val: int) -> dict[str, Any]:
         """Build a rich IOCTL code entry with decoded fields."""
+        device_type = (code_val >> 16) & 0xFFFF
         return {
             "offset": offset,
             "code": f"0x{code_val:08X}",
             "value": code_val,
-            "device_type": (code_val >> 16) & 0xFFFF,
+            "device_type": device_type,
             "function": (code_val >> 2) & 0xFFF,
             "method": code_val & 0x3,
             "access": (code_val >> 14) & 0x3,
+            "known_range": self._match_any_range(code_val, DEFAULT_IOCTL_RANGES),
         }
 
     # ── subprocess wrappers ────────────────────────────────────

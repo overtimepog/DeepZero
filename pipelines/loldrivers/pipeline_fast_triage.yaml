@@ -1,16 +1,16 @@
-# Fast triage with Ghidra gate + aggressive early filtering.
-# fast_extract now filters dead drivers (no IOCTL codes, no device path) BEFORE the Ghidra gate.
-# Ghidra runs ONLY on top 200 priority candidates, not the entire corpus.
-# Semgrep scans decompiled C, filters zero-finding drivers, top 100 survive to LLM.
+# Fast triage with early filtering + Ghidra decompile on all survivors.
+# fast_extract filters dead drivers (no IOCTL codes, no device path).
+# Ghidra runs skip_analysis on ALL survivors — fast enough with lean JVM config.
+# Semgrep scans decompiled C, filters zero-finding drivers, survivors go to LLM.
 #
 # Pipeline flow:
 #   discover (auto-extract .7z/.zip) → kernel_filter → loldrivers_filter → fast_extract+filter
-#     → pick_top_200 (gate by priority_score) → decompile (Ghidra, skip_analysis)
+#     → decompile (Ghidra, skip_analysis, ALL survivors)
 #     → semgrep_barrier → assess (LLM) → cleanup
 
 name: loldrivers_fast
-description: Fast triage with Ghidra gated behind priority scoring + semgrep barrier + early filtering
-version: "5.2"
+description: Fast triage with early filtering + Ghidra on all survivors + semgrep barrier
+version: "6.0"
 
 model: deepseek/deepseek-v4-flash
 
@@ -41,9 +41,12 @@ stages:
   - name: loldrivers_filter
     processor: loldrivers_filter/loldrivers_filter.py
 
-  # Fast IOCTL code + device path extraction via objdump/strings (~2s/driver)
-  # runs on ALL survivors — cheap enrichment + EARLY FILTERING before the Ghidra gate
+  # Fast IOCTL code + device path extraction via Capstone/objdump (~2s/driver)
+  # runs on ALL survivors — cheap enrichment + EARLY FILTERING before Ghidra
   # FILTERS: drops drivers with no IOCTL codes and no device path (dead/irrelevant)
+  # v3.1: IOCTL detection no longer restricted to known device type ranges —
+  # any plausible IOCTL code passes sanity checks. known_range: true/false
+  # added to each IOCTL entry for visibility.
   - name: fast_extract
     processor: objdump_extract/objdump_extract.py
     parallel: 0
@@ -56,20 +59,8 @@ stages:
       min_ioctl_codes: 1
       require_device_path: true
       min_text_section_size: 1024
-      # NOTE: require_dangerous_refs NOT enabled — API names are import symbols,
-      # not C strings. Dangerous API detection already happens in pe_ingest
-      # (discover.dangerous_imports). String-scan refs are supplementary for scoring.
 
-  # gate: only top 200 by fast_extract priority score get the expensive Ghidra treatment
-  # priority_score now reflects: IOCTL count + device paths + dangerous refs + METHOD_NEITHER bonus
-  - name: pick_top_200
-    processor: top_k
-    config:
-      metric_path: fast_extract.priority_score
-      keep_top: 200
-      sort_order: desc
-
-  # Ghidra decompile — only on the top 200 candidates
+  # Ghidra decompile — on ALL survivors (no top_k gate)
   # skip_analysis skips full auto-analysis (type propagation, data-flow) — the dispatch
   # extraction script only needs function identification + decompiler (3-5x faster).
   # ParallelGC beats G1GC for short-lived JVMs. 1g heap is plenty for kernel drivers.
