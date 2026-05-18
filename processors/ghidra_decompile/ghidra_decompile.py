@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +37,11 @@ class GhidraDecompile(MapProcessor):
         max_depth: int | None = None
         ghidra_install_dir: str = ""
         java_home: str = ""
+        skip_analysis: bool = False
+        jvm_max_heap: str = "4g"
+        jvm_init_heap: str = "2g"
+        jvm_gc: str = "G1GC"
+        project_base: str = "/tmp/ghidra_projects"
 
     def validate(self, ctx: ProcessorContext) -> list[str]:
         if not self.config.ghidra_install_dir:
@@ -73,6 +81,14 @@ class GhidraDecompile(MapProcessor):
 
         script_path = self._resolve_script(self.config.strategy)
         output_dir = entry.sample_dir / "decompiled"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Symlink binary into writable temp dir so PyGhidra can create its
+        # project directory alongside it (fails on read-only /mnt/c paths)
+        tmp_dir = Path(tempfile.mkdtemp(prefix="ghidra_", dir=output_dir))
+        binary_copy = tmp_dir / entry.source_path.name
+        binary_copy.symlink_to(entry.source_path.resolve())
+        self.log.debug("symlinked %s -> %s", entry.source_path, binary_copy)
 
         extra_env: dict[str, str] = {}
         if self.config.max_functions is not None:
@@ -81,18 +97,24 @@ class GhidraDecompile(MapProcessor):
             extra_env["DEEPZERO_MAX_DEPTH"] = str(self.config.max_depth)
 
         active_timeout = self.spec.timeout if self.spec.timeout > 0 else self.config.timeout
-        result = self._run_ghidra_headless(
-            binary_path=entry.source_path,
-            output_dir=output_dir,
-            ghidra_install_dir=ghidra_dir,
-            post_script=script_path,
-            timeout=active_timeout,
-            java_home=self.config.java_home,
-            extra_env=extra_env if extra_env else None,
-        )
+        try:
+            result = self._run_ghidra_headless(
+                binary_path=binary_copy,
+                output_dir=output_dir,
+                ghidra_install_dir=ghidra_dir,
+                post_script=script_path,
+                timeout=active_timeout,
+                java_home=self.config.java_home,
+                extra_env=extra_env if extra_env else None,
+            )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
         if not result.get("success", False):
             return ProcessorResult.fail(result.get("error", "ghidra analysis failed"))
+
+        # Clean up Ghidra project files (saves significant disk — .gpr/.rep dirs)
+        self._cleanup_project(entry.source_path.stem)
 
         data: dict[str, Any] = {}
         for key in ("device_name", "symbolic_link", "dispatch_name", "function_count"):
@@ -104,7 +126,39 @@ class GhidraDecompile(MapProcessor):
         if dispatch_file.exists():
             artifacts["dispatch_ioctl"] = "decompiled/dispatch_ioctl.c"
 
+        # Compress large artifacts to save sample-dir storage
+        self._compress_artifact(dispatch_file)
+        gh_result = output_dir / "ghidra_result.json"
+        self._compress_artifact(gh_result)
+
         return ProcessorResult.ok(artifacts=artifacts, data=data)
+
+    def _cleanup_project(self, binary_stem: str) -> None:
+        """Remove Ghidra project dirs (.gpr/.rep) for this binary to reclaim disk."""
+        project_path = Path(self.config.project_base)
+        for suffix in (".gpr", ".rep"):
+            proj_dir = project_path / f"{binary_stem}{suffix}"
+            if proj_dir.exists():
+                try:
+                    shutil.rmtree(proj_dir, ignore_errors=False)
+                    self.log.debug("cleaned up %s", proj_dir)
+                except OSError as e:
+                    self.log.debug("could not clean up %s: %s", proj_dir, e)
+
+    def _compress_artifact(self, path: Path) -> None:
+        """gzip a file in-place, replacing the original. No-op if already .gz."""
+        if not path.exists():
+            return
+        gz_path = path.with_suffix(path.suffix + ".gz")
+        if gz_path.exists():
+            return  # already compressed
+        try:
+            with open(path, "rb") as f_in, gzip.open(gz_path, "wb", compresslevel=6) as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            path.unlink()
+            self.log.debug("compressed %s -> %s", path.name, gz_path.name)
+        except OSError as e:
+            self.log.debug("could not compress %s: %s", path.name, e)
 
     def _resolve_script(self, strategy: str) -> Path:
         local_script = self.processor_dir / "scripts" / strategy
@@ -127,26 +181,47 @@ class GhidraDecompile(MapProcessor):
         post_script: Path,
         timeout: int,
     ) -> list[str]:
-        analyze_headless = self._find_analyze_headless(ghidra_install_dir)
-        project_dir = output_dir / "ghidra_project"
-        project_dir.mkdir(parents=True, exist_ok=True)
-        project_name = f"dz_{binary_path.stem[:20]}"
+        # Use pyghidra CLI (Ghidra 12.1+)
+        pyghidra_bin = self._find_pyghidra()
+
+        # Projects go under configurable temp base (not /mnt/c/ — I/O is 3-5x slower)
+        project_path = Path(self.config.project_base)
+        project_path.mkdir(parents=True, exist_ok=True)
+
         cmd = [
-            str(analyze_headless),
-            str(project_dir),
-            project_name,
-            "-import",
+            str(pyghidra_bin),
             str(binary_path),
-            "-postScript",
             str(post_script),
-            "-scriptPath",
-            str(post_script.parent),
-            "-overwrite",
-            "-deleteProject",
-            "-analysisTimeoutPerFile",
-            str(timeout),
+            "--install-dir", str(ghidra_install_dir),
+            "--project-path", str(project_path),
+            # JVM: bump heap from default 2G, use G1GC for better throughput
+            "-X", f"-Xmx{self.config.jvm_max_heap}",
+            "-X", f"-Xms{self.config.jvm_init_heap}",
+            "-X", f"-XX:+Use{self.config.jvm_gc}",
+            "-D", "-Dcpu.core.limit=8",
         ]
+
+        # Only skip analysis if explicitly configured AND script doesn't need call graphs
+        if self.config.skip_analysis:
+            cmd.append("--skip-analysis")
+
         return cmd
+
+    def _find_pyghidra(self) -> Path:
+        """Locate the pyghidra CLI binary."""
+        pyghidra_path = shutil.which("pyghidra")
+        if pyghidra_path:
+            return Path(pyghidra_path)
+        # Fallback: try common pip user install locations
+        for candidate in [
+            Path.home() / ".local" / "bin" / "pyghidra",
+            Path("/usr/local/bin/pyghidra"),
+        ]:
+            if candidate.exists():
+                return candidate
+        raise FileNotFoundError(
+            "pyghidra CLI not found — install with: pip install pyghidra"
+        )
 
     def _run_ghidra_headless(
         self,

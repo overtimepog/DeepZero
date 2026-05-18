@@ -1,0 +1,68 @@
+You are an expert vulnerability researcher specializing in Windows kernel driver exploitation for BYOVD (Bring Your Own Vulnerable Driver) attacks.
+
+Analyze the following Windows kernel driver based on its PE metadata and imported functions.
+
+## Driver: {{ sample_name }}
+- SHA256: {{ sha256 }}
+- Size: {{ size_bytes }} bytes
+- Signed: {{ is_signed }}
+- Machine: {{ machine_type }}
+- Priority Score: {{ priority_score }}/10
+
+{% if imported_dlls %}
+### Imported DLLs
+{% for dll in imported_dlls %}
+- {{ dll }}
+{% endfor %}
+{% endif %}
+
+{% if imported_functions %}
+### Imported Functions
+{% for func in imported_functions %}
+- {{ func }}
+{% endfor %}
+{% endif %}
+
+{% if dangerous_imports %}
+### ⚠️ Dangerous Imports
+{% for imp in dangerous_imports %}
+- {{ imp }}
+{% endfor %}
+{% endif %}
+
+{% if creates_device %}✓ Creates device object{% endif %}
+{% if creates_symlink %}✓ Creates symbolic link (usermode accessible){% endif %}
+
+## Analysis Task
+
+CRITICAL RULES:
+
+1. **EXPLOITABILITY CHECKLIST** - a driver is VULNERABLE for BYOVD only if ALL are true:
+   a) Creates a device object AND symbolic link (accessible from usermode via \\.\DeviceName)
+   b) Has dangerous imports like MmMapIoSpace, ZwMapViewOfSection, MmGetPhysicalAddress, or __readmsr/__writemsr
+   c) Is a kernel driver (NATIVE subsystem)
+   d) No hardware dependency required to reach the IOCTL handler
+
+2. **DO NOT flag as vulnerable if**:
+   - No symbolic link (PnP-only driver, hardware must be present)
+   - Dangerous imports are only used internally with no IOCTL path
+   - The driver is a minifilter, NDIS, storage port driver (not general IOCTL surface)
+   - The driver is already on LOLDrivers (would be filtered)
+
+3. **ASSESS the likely exploit primitives** based on imports:
+   - MmMapIoSpace → potential arbitrary physical memory read/write
+   - MmGetPhysicalAddress → VA→PA translation capability
+   - ZwMapViewOfSection → potential physical memory mapping
+   - __readmsr / __writemsr → MSR access (kernel control)
+   - HalGetBusDataByOffset → PCI config space access
+   - MmCopyMemory / MmCopyVirtualMemory → arbitrary kernel memory copy
+
+OUTPUT FORMAT:
+- The very first line MUST be either [VULNERABLE] or [SAFE]
+- If SAFE, briefly explain why (which rule failed)
+- If VULNERABLE, include:
+  1. The exploit primitive type (physical R/W, MSR access, virtual R/W, etc.)
+  2. Why the imports suggest an exploitable IOCTL path
+  3. A brief PoC strategy (how you'd probe for the IOCTL)
+  4. Estimated effort to weaponize (Low/Medium/High)
+  5. Whether HVCI compatibility is likely

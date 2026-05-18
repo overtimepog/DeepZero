@@ -260,7 +260,7 @@ def main():
     # write DriverEntry decompilation
     # FIX: Use io.open with utf-8 encoding and unicode() cast for Jython stability
     with io.open(os.path.join(output_dir, "driver_entry.c"), "w", encoding="utf-8") as f:
-        f.write(unicode(entry_c))
+        f.write(str(entry_c))
 
     # extract device name and symbolic link from strings
     for s in currentProgram.getListing().getDefinedData(True):
@@ -338,7 +338,7 @@ def main():
     result["dispatch_c"] = dispatch_c
     # FIX: Use io.open with utf-8 encoding and unicode() cast for Jython stability
     with io.open(os.path.join(output_dir, "dispatch_ioctl.c"), "w", encoding="utf-8") as f:
-        f.write(unicode(dispatch_c))
+        f.write(str(dispatch_c))
 
     # create ioctls subdirectory
     ioctls_dir = os.path.join(output_dir, "ioctls")
@@ -364,7 +364,7 @@ def main():
             f.write("// Method: %d\n" % (code & 0x3))
             f.write("// Device Type: 0x%04X\n" % ((code >> 16) & 0xFFFF))
             f.write("// Function: 0x%03X\n\n" % ((code >> 2) & 0xFFF))
-            f.write(unicode(dispatch_c))
+            f.write(str(dispatch_c))
 
     result["success"] = True
     write_result(output_dir, result)
@@ -374,7 +374,7 @@ def write_result(output_dir, result):
     # FIX: Use io.open with utf-8 and ensure_ascii=False for JSON dump
     with io.open(os.path.join(output_dir, "ghidra_result.json"), "w", encoding="utf-8") as f:
         data = json.dumps(result, indent=2, default=str, ensure_ascii=False)
-        f.write(unicode(data))
+        f.write(str(data))
 
 
 if __name__ == "__main__":

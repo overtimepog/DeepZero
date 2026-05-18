@@ -10,10 +10,10 @@
 #   batch  = N:batch external process (semgrep bulk scan)
 
 name: loldrivers
-description: windows kernel driver vulnerability research pipeline
+description: windows kernel driver vulnerability research pipeline (DeepSeek)
 version: "2.1"
 
-model: vertex_ai/gemini-2.5-pro
+model: deepseek/deepseek-v4-flash
 
 settings:
   work_dir: work
@@ -28,20 +28,6 @@ stages:
       extensions: [".sys"]
       recursive: true
       archive_extensions: [".7z", ".zip"]
-      subsystem_filter: [1]
-      subdirs:
-        - DP_Chipset
-        - DP_LAN_Intel
-        - DP_LAN_Realtek
-        - DP_LAN_Others
-        - DP_WLAN
-        - DP_MassStorage
-        - DP_CardReader
-        - DP_wBluetooth
-        - DP_Touchpad
-        - DP_Biometric
-        - DP_xUSB
-        - DP_Vendor
 
   # filter to kernel drivers with IOCTL attack surface + dedup
   - name: kernel_filter
@@ -56,7 +42,7 @@ stages:
   - name: loldrivers_filter
     processor: loldrivers_filter/loldrivers_filter.py
 
-  # decompile with ghidra - install_dir and java_home come from env via ${} expansion
+  # decompile with ghidra
   # auto-cleans .gpr/.rep project dirs after each decompile
   - name: decompile
     processor: ghidra_decompile/ghidra_decompile.py
@@ -64,7 +50,7 @@ stages:
     timeout: 1800
     config:
       strategy: extract_dispatch.py
-      max_functions: 60
+      max_functions: 100
       max_depth: 4
       ghidra_install_dir: ${GHIDRA_INSTALL_DIR}
       java_home: ${JAVA_HOME:-}

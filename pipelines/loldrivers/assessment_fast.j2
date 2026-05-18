@@ -1,0 +1,106 @@
+You are an expert vulnerability researcher specializing in Windows kernel driver exploitation for BYOVD (Bring Your Own Vulnerable Driver) attacks.
+
+Analyze the following Windows kernel driver based on its PE metadata, imported functions, and fast static analysis.
+
+## Driver: {{ sample_name }}
+- SHA256: {{ sha256 }}
+- Size: {{ size_bytes }} bytes
+- Signed: {{ is_signed }}
+- Machine: {{ machine_type }}
+- Priority Score: {{ priority_score }}/10
+
+{% if imported_dlls %}
+### Imported DLLs
+{% for dll in imported_dlls %}
+- {{ dll }}
+{% endfor %}
+{% endif %}
+
+{% if imported_functions %}
+### Imported Functions
+{% for func in imported_functions[:50] %}
+- {{ func }}
+{% endfor %}{% if imported_functions|length > 50 %}
+... and {{ imported_functions|length - 50 }} more{% endif %}
+{% endif %}
+
+{% if dangerous_imports %}
+### ⚠️ Dangerous Imports
+{% for imp in dangerous_imports %}
+- {{ imp }}
+{% endfor %}
+{% endif %}
+
+{% if creates_device %}✓ Creates device object{% endif %}
+{% if creates_symlink %}✓ Creates symbolic link (usermode accessible){% endif %}
+
+{% if ioctl_codes is defined and ioctl_codes|length > 0 %}
+### 🔍 IOCTL Codes (extracted via objdump, {{ ioctl_codes|length }} found)
+{% for code in ioctl_codes[:30] %}
+- {{ code.code }} (value: {{ code.value }}) at offset 0x{{ code.offset }}
+{% endfor %}{% if ioctl_codes|length > 30 %}
+... and {{ ioctl_codes|length - 30 }} more codes{% endif %}
+{% endif %}
+
+{% if device_paths is defined and device_paths|length > 0 %}
+### 📁 Device Paths (from Unicode strings)
+{% for path in device_paths[:10] %}
+- {{ path }}
+{% endfor %}
+{% endif %}
+
+{% if text_section_size is defined and text_section_size > 0 %}
+### Sections
+- .text size: {{ text_section_size }} bytes
+{% endif %}
+{% if has_executable_data %}⚠️ Section has both CODE and DATA flags (RWX){% endif %}
+
+{% if dangerous_string_refs is defined and dangerous_string_refs|length > 0 %}
+### ⚠️ Dangerous API String References
+{% for ref in dangerous_string_refs %}
+- {{ ref }}
+{% endfor %}
+{% endif %}
+
+## Analysis Task
+
+CRITICAL RULES:
+
+1. **EXPLOITABILITY CHECKLIST** - a driver is VULNERABLE for BYOVD only if ALL are true:
+   a) Creates a device object AND symbolic link (accessible from usermode via \\.\DeviceName)
+   b) Has dangerous imports like MmMapIoSpace, ZwMapViewOfSection, MmGetPhysicalAddress, or __readmsr/__writemsr
+   c) Is a kernel driver (NATIVE subsystem = yes)
+   d) No hardware dependency required to reach the IOCTL handler
+   e) IOCTL codes found AND they are in a user-accessible range (0x220000-0x22FFFF, 0x80000000+, 0x9C400000+, etc.)
+
+2. **USE THE IOCTL CODES** - if IOCTL codes are listed above, analyze them:
+   - 0x22XXXX codes = FILE_DEVICE_UNKNOWN with METHOD_BUFFERED/DIRECT — most common BYOVD target
+   - Multiple IOCTL codes = likely a dispatch table with separate read/write/query handlers
+   - Codes ending in 0x00/0x04/0x08 = typical function progression (open, read, write, ioctl)
+   - Absence of IOCTL codes despite IoCreateDevice = the dispatch might use a different pattern
+
+3. **DO NOT flag as vulnerable if**:
+   - No symbolic link (PnP-only driver, hardware must be present)
+   - Dangerous imports are only used internally with no IOCTL path
+   - The driver is a minifilter, NDIS, storage port driver (not general IOCTL surface)
+   - No IOCTL codes found AND no device path = likely not user-accessible
+   - The device path suggests PnP enumeration (e.g., \\Device\\000000xx)
+
+4. **ASSESS the likely exploit primitives** based on imports + IOCTL patterns:
+   - MmMapIoSpace + IOCTL codes → potential arbitrary physical memory read/write
+   - MmGetPhysicalAddress → VA→PA translation capability
+   - ZwMapViewOfSection → potential physical memory mapping
+   - __readmsr / __writemsr → MSR access (kernel control)
+   - HalGetBusDataByOffset → PCI config space access
+   - MmCopyMemory / MmCopyVirtualMemory → arbitrary kernel memory copy
+   - Multiple IOCTL codes (3+) with dangerous imports = high confidence of exploitable dispatch
+
+OUTPUT FORMAT:
+- The very first line MUST be either [VULNERABLE] or [SAFE]
+- If SAFE, briefly explain why (which rule failed)
+- If VULNERABLE, include:
+  1. The exploit primitive type (physical R/W, MSR access, virtual R/W, etc.)
+  2. Why the import + IOCTL combination suggests an exploitable path
+  3. A brief PoC strategy (how you'd probe the IOCTL codes)
+  4. Estimated effort to weaponize (Low/Medium/High)
+  5. Whether HVCI compatibility is likely

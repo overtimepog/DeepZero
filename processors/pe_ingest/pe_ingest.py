@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
+import subprocess
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -11,19 +14,29 @@ class PEIngest(IngestProcessor):
     description = (
         "discovers portable executable files, parses PE headers, and extracts driver metadata"
     )
-    version = "2.0"
+    version = "2.1"
 
     def process(self, ctx: ProcessorContext, target: Path) -> list[Sample]:
         extensions = self.config.get("extensions", [".sys"])
         recursive = self.config.get("recursive", True)
         subdirs = self.config.get("subdirs", [])
+        archive_extensions = self.config.get("archive_extensions", [])
+        archive_cache_dir = self.config.get("archive_cache_dir", "")
 
         if target.is_file():
+            # Try archive extraction for single archive files
+            if target.suffix.lower() in (".7z", ".zip") and archive_extensions:
+                return self._ingest_archive(ctx, target, extensions, recursive, archive_cache_dir)
             return self._ingest_single(target)
 
         if not target.is_dir():
             self.log.error("target does not exist: %s", target)
             return []
+
+        # Extract archives first if configured, so downstream .sys discovery
+        # picks up the extracted files alongside any pre-existing .sys files.
+        if archive_extensions:
+            self._extract_archives(ctx, target, archive_extensions, archive_cache_dir)
 
         if subdirs:
             return self._ingest_filtered(ctx, target, subdirs, extensions)
@@ -35,6 +48,72 @@ class PEIngest(IngestProcessor):
         data = self._extract_metadata(path)
         sample_id = data.get("sha256", "")[:16] or path.stem
         return [Sample(sample_id=sample_id, source_path=path, filename=path.name, data=data)]
+
+    # ── archive extraction ────────────────────────────────────────────────
+
+    def _resolve_archive_cache(self, target: Path, archive_cache_dir: str) -> Path:
+        """Resolve the archive extraction cache directory."""
+        if archive_cache_dir:
+            cache = Path(archive_cache_dir)
+        else:
+            cache = target / ".deepzero_cache" / "extracted"
+        cache.mkdir(parents=True, exist_ok=True)
+        return cache
+
+    def _extract_archives(
+        self, ctx: ProcessorContext, target: Path,
+        archive_extensions: list[str], archive_cache_dir: str,
+    ) -> None:
+        """Find and extract .7z/.zip archives before .sys discovery."""
+        archives: list[Path] = []
+        for ext in archive_extensions:
+            ext = ext if ext.startswith(".") else f".{ext}"
+            archives.extend(target.rglob(f"*{ext}"))
+        archives = sorted(set(archives))
+
+        if not archives:
+            return
+
+        self.log.info("found %d archives to extract", len(archives))
+        cache = self._resolve_archive_cache(target, archive_cache_dir)
+
+        for arc in archives:
+            dest = cache / arc.stem
+            sentinel = dest / ".extracted"
+            if sentinel.exists():
+                self.log.debug("archive already extracted: %s -> %s", arc.name, dest)
+                continue
+
+            self.log.info("extracting: %s ...", arc.name)
+            dest.mkdir(parents=True, exist_ok=True)
+            try:
+                _extract_archive(arc, dest)
+                sentinel.touch()
+                self.log.info("extracted %d files from %s",
+                              sum(1 for _ in dest.rglob("*") if _.is_file()), arc.name)
+            except Exception as e:
+                self.log.error("failed to extract %s: %s", arc.name, e)
+
+    def _ingest_archive(
+        self, ctx: ProcessorContext, target: Path,
+        extensions: list[str], recursive: bool, archive_cache_dir: str,
+    ) -> list[Sample]:
+        """Single-file mode: target is an archive. Extract and discover .sys inside."""
+        cache = self._resolve_archive_cache(target.parent, archive_cache_dir)
+        dest = cache / target.stem
+        sentinel = dest / ".extracted"
+
+        if not sentinel.exists():
+            self.log.info("extracting: %s ...", target.name)
+            dest.mkdir(parents=True, exist_ok=True)
+            _extract_archive(target, dest)
+            sentinel.touch()
+        else:
+            self.log.info("archive already extracted: %s", target.name)
+
+        return self._ingest_directory(ctx, dest, extensions, recursive)
+
+    # ── directory scanning ────────────────────────────────────────────────
 
     def _ingest_filtered(
         self, ctx: ProcessorContext, root: Path, subdirs: list[str], extensions: list[str]
@@ -87,7 +166,7 @@ class PEIngest(IngestProcessor):
         )
 
         subsys_filter = self.config.get("subsystem_filter", [])
-        max_workers = ctx.get_setting("max_workers", 8)
+        max_workers = ctx.get_setting("max_workers", 5)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # We map in order, so progress is more stable
@@ -137,6 +216,24 @@ class PEIngest(IngestProcessor):
         if data is not None and data[:2] == b"MZ":
             meta.update(_parse_pe(data, self.config.get("subsystem_filter", [])))
         return meta
+
+
+def _extract_archive(archive: Path, dest: Path) -> None:
+    """Extract .7z or .zip archive to dest directory."""
+    suffix = archive.suffix.lower()
+    if suffix == ".zip":
+        with zipfile.ZipFile(archive, "r") as zf:
+            zf.extractall(dest)
+    elif suffix == ".7z":
+        # prefer 7z CLI (handles solid archives, large files)
+        result = subprocess.run(
+            ["7z", "x", "-y", f"-o{dest}", str(archive)],
+            capture_output=True, text=True, timeout=600,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"7z failed: {result.stderr.strip()}")
+    else:
+        raise ValueError(f"unsupported archive format: {suffix}")
 
 
 def _io_worker(f: Path) -> tuple[Path, dict[str, Any], bytes | None]:

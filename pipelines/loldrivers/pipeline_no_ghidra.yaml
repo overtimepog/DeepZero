@@ -1,0 +1,64 @@
+# Simplified pipeline: no Ghidra decompile needed
+# PE metadata + dangerous imports → LLM assessment
+
+name: loldrivers
+description: windows kernel driver vuln research (no-ghidra, DeepSeek)
+version: "2.1"
+
+model: deepseek/deepseek-v4-flash
+
+settings:
+  work_dir: work
+  max_workers: 4
+
+stages:
+  # discover PE files, parse headers, extract driver metadata
+  # auto-extracts .7z/.zip archives into .deepzero_cache/extracted/
+  - name: discover
+    processor: pe_ingest/pe_ingest.py
+    config:
+      extensions: [".sys"]
+      recursive: true
+      archive_extensions: [".7z", ".zip"]
+
+  # filter to kernel drivers with IOCTL attack surface + dedup
+  - name: kernel_filter
+    processor: metadata_filter
+    config:
+      require:
+        is_kernel_driver: true
+        has_ioctl_surface: true
+      dedup_field: sha256
+
+  # exclude known LOLDrivers
+  - name: loldrivers_filter
+    processor: loldrivers_filter/loldrivers_filter.py
+
+  # pick top 20 candidates by priority score
+  - name: pick_top_20
+    processor: top_k
+    config:
+      metric_path: discover.priority_score
+      keep_top: 20
+      sort_order: desc
+
+  # llm deep analysis based on PE metadata and dangerous imports
+  - name: assess
+    processor: generic_llm
+    parallel: 2
+    on_failure: skip
+    config:
+      prompt: pipelines/loldrivers/assessment_no_ghidra.j2
+      output_file: assessment.md
+      classify_by: "\\\\[VULNERABLE\\\\]|\\\\[SAFE\\\\]"
+      max_context_tokens: 128000
+      max_retries: 3
+
+  # post-pipeline storage cleanup: remove filtered/failed dirs, compress artifacts, wipe caches
+  - name: cleanup
+    processor: work_cleanup/work_cleanup.py
+    config:
+      clean_filtered: true
+      compress_artifacts: true
+      clean_archive_cache: true
+      cleanup_stale_ghidra: false

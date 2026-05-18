@@ -1,0 +1,116 @@
+# Fast triage with Ghidra gate + aggressive early filtering.
+# fast_extract now filters dead drivers (no IOCTL codes, no device path) BEFORE the Ghidra gate.
+# Ghidra runs ONLY on top 200 priority candidates, not the entire corpus.
+# Semgrep scans decompiled C, filters zero-finding drivers, top 100 survive to LLM.
+#
+# Pipeline flow:
+#   discover (auto-extract .7z/.zip) → kernel_filter → loldrivers_filter → fast_extract+filter
+#     → pick_top_200 (gate by priority_score) → decompile (Ghidra)
+#     → semgrep_barrier → assess (LLM) → cleanup
+
+name: loldrivers_fast
+description: Fast triage with Ghidra gated behind priority scoring + semgrep barrier + early filtering
+version: "5.1"
+
+model: deepseek/deepseek-v4-flash
+
+settings:
+  work_dir: work
+  max_workers: 5
+
+stages:
+  # discover PE files, parse headers, extract driver metadata (LIEF)
+  # auto-extracts .7z/.zip archives into .deepzero_cache/extracted/
+  - name: discover
+    processor: pe_ingest/pe_ingest.py
+    config:
+      extensions: [".sys"]
+      recursive: true
+      archive_extensions: [".7z", ".zip"]
+
+  # filter to kernel drivers with IOCTL attack surface + dedup
+  - name: kernel_filter
+    processor: metadata_filter
+    config:
+      require:
+        is_kernel_driver: true
+        has_ioctl_surface: true
+      dedup_field: sha256
+
+  # exclude known LOLDrivers
+  - name: loldrivers_filter
+    processor: loldrivers_filter/loldrivers_filter.py
+
+  # Fast IOCTL code + device path extraction via objdump/strings (~2s/driver)
+  # runs on ALL survivors — cheap enrichment + EARLY FILTERING before the Ghidra gate
+  # FILTERS: drops drivers with no IOCTL codes and no device path (dead/irrelevant)
+  - name: fast_extract
+    processor: objdump_extract/objdump_extract.py
+    parallel: 0
+    config:
+      max_ioctl_codes: 50
+      extract_device_paths: true
+      extract_section_info: true
+      extract_rdata_scan: true
+      # Filtering — drop drivers that can't be exploited
+      min_ioctl_codes: 1
+      require_device_path: true
+      min_text_section_size: 1024
+      # NOTE: require_dangerous_refs NOT enabled — API names are import symbols,
+      # not C strings. Dangerous API detection already happens in pe_ingest
+      # (discover.dangerous_imports). String-scan refs are supplementary for scoring.
+
+  # gate: only top 200 by fast_extract priority score get the expensive Ghidra treatment
+  # priority_score now reflects: IOCTL count + device paths + dangerous refs + METHOD_NEITHER bonus
+  - name: pick_top_200
+    processor: top_k
+    config:
+      metric_path: fast_extract.priority_score
+      keep_top: 200
+      sort_order: desc
+
+  # Ghidra decompile — only on the top 200 candidates
+  # auto-cleans .gpr/.rep project dirs after each decompile
+  - name: decompile
+    processor: ghidra_decompile/ghidra_decompile.py
+    parallel: 20
+    timeout: 1800
+    config:
+      strategy: extract_dispatch.py
+      max_functions: 60
+      max_depth: 4
+      ghidra_install_dir: ${GHIDRA_INSTALL_DIR}
+      java_home: ${JAVA_HOME:-}
+      skip_analysis: false
+      jvm_max_heap: "4g"
+      jvm_init_heap: "2g"
+      jvm_gc: "G1GC"
+      project_base: "/tmp/ghidra_projects"
+
+  # semgrep batch scan on decompiled C — barrier: drops drivers with 0 findings
+  - name: semgrep_barrier
+    processor: semgrep_scanner/semgrep_scanner.py
+    config:
+      min_findings: 1
+      rules_dir: pipelines/loldrivers/rules
+
+  # LLM deep analysis with full context: PE metadata + IOCTL codes + decompiled dispatch + semgrep findings
+  - name: assess
+    processor: generic_llm
+    parallel: 0
+    on_failure: skip
+    config:
+      prompt: pipelines/loldrivers/assessment.j2
+      output_file: assessment.md
+      classify_by: "\\\\[VULNERABLE\\\\]|\\\\[SAFE\\\\]"
+      max_context_tokens: 128000
+      max_retries: 3
+
+  # post-pipeline storage cleanup: remove filtered/failed dirs, compress artifacts, wipe caches
+  - name: cleanup
+    processor: work_cleanup/work_cleanup.py
+    config:
+      clean_filtered: true
+      compress_artifacts: true
+      clean_archive_cache: true
+      cleanup_stale_ghidra: true
