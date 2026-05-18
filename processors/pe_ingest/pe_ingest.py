@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 import time
 import zipfile
@@ -14,7 +15,7 @@ class PEIngest(IngestProcessor):
     description = (
         "discovers portable executable files, parses PE headers, and extracts driver metadata"
     )
-    version = "2.1"
+    version = "2.2"
 
     def process(self, ctx: ProcessorContext, target: Path) -> list[Sample]:
         extensions = self.config.get("extensions", [".sys"])
@@ -55,10 +56,30 @@ class PEIngest(IngestProcessor):
                 archive_timeout,
             )
 
-        if subdirs:
-            return self._ingest_filtered(ctx, target, subdirs, extensions)
+        # Fast path: if PE metadata cache exists and all cached source files
+        # still present on disk, return instantly — zero file I/O, zero PE parsing.
+        # Only for full-directory scans (not subdirs-filtered mode).
+        if not subdirs:
+            cache_hit = self._load_pe_cache(target, extensions, recursive)
+            if cache_hit is not None:
+                self.log.info(
+                    "pe cache hit: %d samples loaded instantly (0.0s)",
+                    len(cache_hit),
+                )
+                ctx.progress.update(total=len(cache_hit), description="loaded from cache")
+                ctx.progress.update(amount=len(cache_hit), description="done")
+                return cache_hit
 
-        return self._ingest_directory(ctx, target, extensions, recursive)
+        if subdirs:
+            samples = self._ingest_filtered(ctx, target, subdirs, extensions)
+        else:
+            samples = self._ingest_directory(ctx, target, extensions, recursive)
+
+        # Save PE metadata cache for instant re-runs (full-directory mode only)
+        if not subdirs and samples:
+            self._save_pe_cache(target, samples)
+
+        return samples
 
     def _ingest_single(self, path: Path) -> list[Sample]:
         self.log.info("single file mode: %s", path.name)
@@ -288,6 +309,101 @@ class PEIngest(IngestProcessor):
             meta.update(_parse_pe(data, self.config.get("subsystem_filter", [])))
         return meta
 
+    # ── PE metadata cache ─────────────────────────────────────────────────
+
+    CACHE_VERSION = 1
+
+    def _resolve_pe_cache(self, target: Path) -> Path:
+        """Resolve the PE metadata cache file path."""
+        cache_dir = target / ".deepzero_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir / "pe_metadata.json"
+
+    def _load_pe_cache(
+        self, target: Path, extensions: list[str], recursive: bool
+    ) -> list[Sample] | None:
+        """Load cached PE metadata. Returns None if cache doesn't exist,
+        any cached source file is missing, or file count changed (new files
+        added to corpus since cache was saved)."""
+        cache_path = self._resolve_pe_cache(target)
+        if not cache_path.exists():
+            return None
+
+        try:
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            self.log.debug("pe cache unreadable: %s", e)
+            return None
+
+        if data.get("version") != self.CACHE_VERSION:
+            self.log.debug("pe cache version mismatch")
+            return None
+
+        entries = data.get("entries", {})
+        if not entries:
+            return None
+
+        # Quick file-count check: if new .sys files were added to the corpus,
+        # the cache is stale. rglob is cheap — directory listing only, no I/O.
+        cached_count = data.get("cache_size", 0)
+        live_count = 0
+        for ext in extensions:
+            ext = ext if ext.startswith(".") else f".{ext}"
+            if recursive:
+                live_count += sum(1 for _ in target.rglob(f"*{ext}"))
+            else:
+                live_count += sum(1 for _ in target.glob(f"*{ext}"))
+        if live_count != cached_count:
+            self.log.debug(
+                "pe cache invalidated: live file count %d != cached %d",
+                live_count,
+                cached_count,
+            )
+            return None
+
+        # Verify all cached source files still exist
+        samples: list[Sample] = []
+        for source_path_str, entry in entries.items():
+            source_path = Path(source_path_str)
+            if not source_path.exists():
+                self.log.debug(
+                    "pe cache invalidated: %s no longer exists", source_path_str
+                )
+                return None
+            samples.append(
+                Sample(
+                    sample_id=entry["sample_id"],
+                    source_path=source_path,
+                    filename=entry["filename"],
+                    data=entry["data"],
+                )
+            )
+
+        return samples
+
+    def _save_pe_cache(self, target: Path, samples: list[Sample]) -> None:
+        """Save PE metadata to cache for instant re-runs."""
+        cache_path = self._resolve_pe_cache(target)
+        entries: dict[str, dict[str, Any]] = {}
+        for s in samples:
+            entries[str(s.source_path)] = {
+                "sample_id": s.sample_id,
+                "filename": s.filename,
+                "data": s.data,
+            }
+
+        payload = {
+            "version": self.CACHE_VERSION,
+            "cache_size": len(samples),
+            "entries": entries,
+        }
+
+        try:
+            cache_path.write_text(json.dumps(payload), encoding="utf-8")
+            self.log.info("pe cache saved: %d entries", len(samples))
+        except OSError as e:
+            self.log.warning("failed to save pe cache: %s", e)
+
 
 def _extract_one(archive: Path, dest: Path, timeout: int) -> tuple[Path, int]:
     """Extract an archive and return (dest, file_count). Thread-safe — each
@@ -418,6 +534,7 @@ def _parse_pe(data: bytes, subsystem_filter: list[int]) -> dict[str, Any]:
         "MmLoadSystemImage",
     }
     meta["dangerous_imports"] = sorted(func_set & dangerous_apis)
+    meta["dangerous_import_count"] = len(meta["dangerous_imports"])
 
     is_signed = False
     try:
