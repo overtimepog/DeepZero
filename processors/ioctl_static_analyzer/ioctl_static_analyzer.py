@@ -145,23 +145,26 @@ class IoctlStaticAnalyzer(MapProcessor):
                     "confidence": case.confidence,
                     "source": case.source,
                     "handler_va": f"0x{case.handler_va:x}",
+                    "handler_symbol": case.handler_symbol or "",
                 })
             if len(ioctl_codes) >= self.config.max_ioctl_codes:
                 break
 
         ioctl_count = len(ioctl_codes)
 
-        # Device paths from IoCreateDevice refs
+        # Device paths from IoCreateDevice refs (direct + wrapper)
         device_paths: list[str] = []
         device_path_count = 0
-        if result.io_create_device_refs:
-            # We can't extract the actual device name strings without decompilation,
-            # but we know the driver creates devices — mark it
+        has_device_refs = bool(result.io_create_device_refs) or bool(
+            getattr(result, "io_create_device_wrapper_refs", [])
+        )
+        has_symlink_refs = bool(result.io_create_symbolic_link_refs) or bool(
+            getattr(result, "io_create_symbolic_link_wrapper_refs", [])
+        )
+        if has_device_refs:
             device_paths.append("\\Device\\<IoCreateDevice-ref>")
             device_path_count = 1
-
-        # Symbolic link refs
-        if result.io_create_symbolic_link_refs:
+        if has_symlink_refs:
             device_paths.append("\\DosDevices\\<IoCreateSymbolicLink-ref>")
             device_path_count += 1
 
