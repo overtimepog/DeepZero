@@ -91,9 +91,8 @@ class PEIngest(IngestProcessor):
 
         max_workers = min(len(pending), ctx.get_setting("max_workers", 4))
         self.log.info(
-            "extracting %d archives in parallel (%d workers): %s",
+            "extracting %d archives in parallel (%d workers)",
             len(pending), max_workers,
-            ", ".join(a.name for a in pending[:10]) + ("..." if len(pending) > 10 else ""),
         )
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
