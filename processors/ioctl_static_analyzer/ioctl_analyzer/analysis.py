@@ -134,8 +134,15 @@ class DriverAnalyzer:
 
     def analyze(self, include_cfg: bool = True) -> AnalysisResult:
         imports = self.image.imports()
-        io_create_device_refs = self.find_import_call_refs("IoCreateDevice")
-        io_create_symbolic_link_refs = self.find_import_call_refs("IoCreateSymbolicLink")
+
+        # Single-pass scan of all executable sections for import call refs.
+        # Previously find_import_call_refs was called twice (once per import),
+        # each disassembling the entire .text section from scratch. For large
+        # drivers (camera, GPU) with 500KB+ .text sections this was the #1
+        # bottleneck — 2x full Capstone disasm before any analysis started.
+        io_create_device_refs, io_create_symbolic_link_refs = \
+            self._find_import_call_refs_batch(["IoCreateDevice", "IoCreateSymbolicLink"])
+
         init_functions = self._discover_initialization_functions(self.image.entry_point_va, max_depth=3)
         io_create_device_wrapper_refs = self.find_import_wrapper_refs("IoCreateDevice", init_functions)
         io_create_symbolic_link_wrapper_refs = self.find_import_wrapper_refs("IoCreateSymbolicLink", init_functions)
@@ -170,6 +177,35 @@ class DriverAnalyzer:
                 if direct == iat or mem == iat:
                     refs.add(int(ins.address))
         return sorted(refs)
+
+    def _find_import_call_refs_batch(self, import_names: list[str]) -> list[list[int]]:
+        """Single-pass scan for multiple import call refs. Disassembles each
+        executable section ONCE and checks all IAT addresses simultaneously.
+        For large .text sections (camera/GPU drivers), this avoids redundant
+        full-disassembly passes that were the #1 perf bottleneck."""
+        iats: dict[str, int | None] = {}
+        refs: dict[str, set[int]] = {}
+        for name in import_names:
+            iat = self.image.import_iat_va(name)
+            iats[name] = iat
+            refs[name] = set()
+            if iat is None:
+                self.warnings.append(
+                    f"Import {name} was not found; refs may be resolved "
+                    f"dynamically or statically linked."
+                )
+
+        for _, instrs in self.disasm.disassemble_section_streams():
+            for ins in instrs:
+                if not ins.group(CS_GRP_CALL):
+                    continue
+                direct = direct_imm_target(ins)
+                mem = mem_displacement_target(ins)
+                for name, iat in iats.items():
+                    if iat is not None and (direct == iat or mem == iat):
+                        refs[name].add(int(ins.address))
+
+        return [sorted(refs[name]) for name in import_names]
 
     def find_import_wrapper_refs(self, import_name: str, init_functions: set[int]) -> list[dict[str, str]]:
         """Find init helper calls that eventually call a target import.
